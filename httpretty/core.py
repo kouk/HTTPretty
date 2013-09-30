@@ -33,6 +33,7 @@ import itertools
 import warnings
 import logging
 import traceback
+import json
 
 
 from .compat import (
@@ -65,6 +66,7 @@ from .errors import HTTPrettyError
 
 from datetime import datetime
 from datetime import timedelta
+from errno import EAGAIN
 
 old_socket = socket.socket
 old_create_connection = socket.create_connection
@@ -94,26 +96,40 @@ except ImportError:
     ssl = None
 
 
-POTENTIAL_HTTP_PORTS = [80, 443]
+POTENTIAL_HTTP_PORTS = set([80, 443])
 
 
 class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
     def __init__(self, headers, body=''):
         self.body = utf8(body)
         self.raw_headers = utf8(headers)
-        self.rfile = StringIO(b'\r\n\r\n'.join([headers.strip(), body]))
+        self.rfile = StringIO(b'\r\n\r\n'.join([utf8(headers.strip()), self.body]))
         self.wfile = StringIO()
         self.raw_requestline = self.rfile.readline()
         self.error_code = self.error_message = None
         self.parse_request()
         self.method = self.command
         self.querystring = parse_qs(self.path.split("?", 1)[-1])
+        self.parsed_body = self.__parse_body(self.body)
 
     def __str__(self):
         return 'HTTPrettyRequest(headers={0}, body="{1}")'.format(
             self.headers,
             self.body,
         )
+
+    def __parse_body(self, body):
+        """ Attempt to parse the post based on the content-type passed. Return the regular body if not """
+        return_value = body.decode('utf-8')
+        try:
+            for header in self.headers.keys():
+                if header.lower() == 'content-type':
+                    if self.headers['content-type'].lower() == 'application/json':
+                        return_value = json.loads(return_value)
+                    elif self.headers['content-type'].lower() == 'application/x-www-form-urlencoded':
+                        return_value = parse_qs(return_value)
+        finally:
+            return return_value
 
 
 class EmptyRequestHeaders(dict):
@@ -221,8 +237,9 @@ class fakesock(object):
                     _d = self.truesock.recv(16)
                     self.truesock.settimeout(0.0)
                     self.fd.write(_d)
-
-                except socket.error:
+                except socket.error as e:
+                    if e.errno == EAGAIN:
+                        continue
                     break
 
             self.fd.seek(0)
@@ -247,13 +264,7 @@ class fakesock(object):
                     headers = utf8(last_requestline(self._sent_data))
                     body = utf8(self._sent_data[-1])
 
-                    last_entry = self._entry
-                    last_entry.request.body = body
-                    request_headers = dict(last_entry.request.headers)
-                    # If we are receiving more data and the last entry to be processed
-                    # was a callback responsed, send the new data to the callback
-                    if last_entry.body_is_callable:
-                        last_entry.callable_body(last_entry.request, last_entry.info.full_url(), request_headers)
+                    self._entry.request.body += body
 
                     try:
                         return httpretty.historify_request(headers, body, False)
@@ -263,7 +274,7 @@ class fakesock(object):
 
             # path might come with
             s = urlsplit(path)
-            POTENTIAL_HTTP_PORTS.append(int(s.port or 80))
+            POTENTIAL_HTTP_PORTS.add(int(s.port or 80))
             headers, body = map(utf8, data.split(b'\r\n\r\n', 1))
 
             request = httpretty.historify_request(headers, body)
@@ -349,7 +360,7 @@ def create_fake_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, sour
 
 
 def fake_gethostbyname(host):
-    return host
+    return '127.0.0.1'
 
 
 def fake_gethostname():
@@ -553,12 +564,12 @@ class URIInfo(BaseClass):
     def __eq__(self, other):
         self_tuple = (
             self.port,
-            decode_utf8(self.hostname),
+            decode_utf8(self.hostname.lower()),
             url_fix(decode_utf8(self.path)),
         )
         other_tuple = (
             other.port,
-            decode_utf8(other.hostname),
+            decode_utf8(other.hostname.lower()),
             url_fix(decode_utf8(other.path)),
         )
         return self_tuple == other_tuple
@@ -585,7 +596,7 @@ class URIInfo(BaseClass):
     @classmethod
     def from_uri(cls, uri, entry):
         result = urlsplit(uri)
-        POTENTIAL_HTTP_PORTS.append(int(result.port or 80))
+        POTENTIAL_HTTP_PORTS.add(int(result.port or 80))
         return cls(result.username,
                    result.password,
                    result.hostname,
